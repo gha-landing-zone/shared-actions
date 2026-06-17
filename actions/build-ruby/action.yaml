@@ -1,0 +1,67 @@
+name: "Build Ruby Service"
+description: "Install dependencies, lint, and test a Ruby or Rails project"
+
+inputs:
+  ruby-version:
+    description: "Ruby version (e.g. 3.2, 3.3)"
+    required: false
+    default: "3.3"
+  working-directory:
+    description: "Path to the project root relative to repo root"
+    required: false
+    default: "."
+  bundler-version:
+    description: "Bundler version to use (defaults to version in Gemfile.lock)"
+    required: false
+    default: ""
+  run-rubocop:
+    description: "Whether to run RuboCop linting"
+    required: false
+    default: "true"
+  test-command:
+    description: "Command used to run tests (e.g. bundle exec rspec, bundle exec rake test)"
+    required: false
+    default: "bundle exec rspec"
+  database-url:
+    description: "DATABASE_URL for test suite (if needed)"
+    required: false
+    default: ""
+
+outputs:
+  gemfile-lock-hash:
+    description: "Hash of Gemfile.lock for cache keying downstream"
+    value: ${{ steps.hash.outputs.gemfile-lock-hash }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ inputs.ruby-version }}
+        bundler: ${{ inputs.bundler-version }}
+        bundler-cache: true
+        working-directory: ${{ inputs.working-directory }}
+
+    - name: Compute Gemfile.lock hash
+      id: hash
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        HASH=$(sha256sum Gemfile.lock | awk '{print $1}')
+        echo "gemfile-lock-hash=${HASH}" >> $GITHUB_OUTPUT
+
+    - name: Run RuboCop
+      if: inputs.run-rubocop == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: bundle exec rubocop --format github
+
+    - name: Run tests
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DATABASE_URL: ${{ inputs.database-url }}
+        RAILS_ENV: test
+        CI: "true"
+      run: ${{ inputs.test-command }}
