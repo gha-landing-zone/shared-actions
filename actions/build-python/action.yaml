@@ -1,0 +1,123 @@
+name: "Build Python Service"
+description: "Install dependencies, lint, type-check, and test a Python project"
+
+inputs:
+  python-version:
+    description: "Python version (e.g. 3.11, 3.12)"
+    required: false
+    default: "3.12"
+  package-manager:
+    description: "Dependency manager: pip, poetry, or uv"
+    required: false
+    default: "pip"
+  working-directory:
+    description: "Path to the project root relative to repo root"
+    required: false
+    default: "."
+  run-mypy:
+    description: "Whether to run mypy type checking"
+    required: false
+    default: "true"
+  run-ruff:
+    description: "Whether to run ruff linting"
+    required: false
+    default: "true"
+  test-command:
+    description: "Command to run tests"
+    required: false
+    default: "pytest"
+
+outputs:
+  dist-path:
+    description: "Path to built distribution files (if applicable)"
+    value: ${{ steps.build.outputs.dist-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install uv
+      if: inputs.package-manager == 'uv'
+      shell: bash
+      run: pip install uv
+
+    - name: Install Poetry
+      if: inputs.package-manager == 'poetry'
+      shell: bash
+      run: pip install poetry
+
+    - name: Cache dependencies (pip)
+      if: inputs.package-manager == 'pip'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
+        restore-keys: ${{ runner.os }}-pip-
+
+    - name: Cache dependencies (poetry)
+      if: inputs.package-manager == 'poetry'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pypoetry
+        key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+        restore-keys: ${{ runner.os }}-poetry-
+
+    - name: Install dependencies (pip)
+      if: inputs.package-manager == 'pip'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        pip install --upgrade pip
+        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt
+        elif [ -f requirements.txt ]; then pip install -r requirements.txt
+        fi
+
+    - name: Install dependencies (poetry)
+      if: inputs.package-manager == 'poetry'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: poetry install --with dev
+
+    - name: Install dependencies (uv)
+      if: inputs.package-manager == 'uv'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: uv sync --all-extras
+
+    - name: Lint with Ruff
+      if: inputs.run-ruff == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        RUNNER="${{ inputs.package-manager == 'poetry' && 'poetry run' || inputs.package-manager == 'uv' && 'uv run' || '' }}"
+        $RUNNER ruff check . --output-format github
+
+    - name: Type check with mypy
+      if: inputs.run-mypy == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        RUNNER="${{ inputs.package-manager == 'poetry' && 'poetry run' || inputs.package-manager == 'uv' && 'uv run' || '' }}"
+        $RUNNER mypy .
+
+    - name: Run tests
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        RUNNER="${{ inputs.package-manager == 'poetry' && 'poetry run' || inputs.package-manager == 'uv' && 'uv run' || '' }}"
+        $RUNNER ${{ inputs.test-command }} --tb=short
+
+    - name: Build distribution (if pyproject.toml exists)
+      id: build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -f pyproject.toml ]; then
+          RUNNER="${{ inputs.package-manager == 'poetry' && 'poetry' || inputs.package-manager == 'uv' && 'uv' || 'pip' }}"
+          $RUNNER build 2>/dev/null || true
+          echo "dist-path=dist/" >> $GITHUB_OUTPUT
+        fi
