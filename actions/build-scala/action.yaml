@@ -1,0 +1,60 @@
+name: "Build Scala Service"
+description: "Compile, test, and package a Scala project using sbt"
+
+inputs:
+  java-version:
+    description: "Java version to use (Scala runs on JVM)"
+    required: false
+    default: "21"
+  scala-version:
+    description: "Scala version (e.g. 2.13.12, 3.3.1) — informational, sbt manages this"
+    required: false
+    default: "2.13.12"
+  build-tool:
+    description: "Build tool to use: sbt"
+    required: false
+    default: "sbt"
+  working-directory:
+    description: "Path to the project root relative to repo root"
+    required: false
+    default: "."
+  sbt-args:
+    description: "Additional sbt commands/arguments"
+    required: false
+    default: ""
+
+outputs:
+  artifact-path:
+    description: "Path to the built assembly JAR"
+    value: ${{ steps.build-sbt.outputs.artifact-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ inputs.java-version }}
+        distribution: temurin
+
+    - name: Cache sbt dependencies
+      if: inputs.build-tool == 'sbt'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.sbt
+          ~/.ivy2/cache
+          ~/.coursier
+        key: ${{ runner.os }}-sbt-${{ hashFiles('**/*.sbt', '**/project/build.properties', '**/project/plugins.sbt') }}
+        restore-keys: ${{ runner.os }}-sbt-
+
+    - name: Build with sbt
+      if: inputs.build-tool == 'sbt'
+      id: build-sbt
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        sbt -Dsbt.log.noformat=true clean test assembly ${{ inputs.sbt-args }}
+        ARTIFACT=$(find . -path '*/target/scala-*/assembly*.jar' | head -1)
+        echo "artifact-path=${ARTIFACT}" >> $GITHUB_OUTPUT
+        echo "✅ Built artifact: ${ARTIFACT}"
