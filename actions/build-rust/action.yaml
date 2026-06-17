@@ -1,0 +1,98 @@
+name: "Build Rust Service"
+description: "Lint, test, and build a Rust project using Cargo"
+
+inputs:
+  rust-toolchain:
+    description: "Rust toolchain: stable, beta, nightly, or a specific version"
+    required: false
+    default: "stable"
+  working-directory:
+    description: "Path to the project root relative to repo root"
+    required: false
+    default: "."
+  run-clippy:
+    description: "Whether to run Clippy linting"
+    required: false
+    default: "true"
+  run-fmt:
+    description: "Whether to check rustfmt formatting"
+    required: false
+    default: "true"
+  cargo-args:
+    description: "Additional cargo build arguments (e.g. --release)"
+    required: false
+    default: "--release"
+  features:
+    description: "Comma-separated list of Cargo features to enable"
+    required: false
+    default: ""
+  target:
+    description: "Compile target triple (e.g. x86_64-unknown-linux-musl)"
+    required: false
+    default: ""
+
+outputs:
+  binary-path:
+    description: "Path to the compiled binary"
+    value: ${{ steps.build.outputs.binary-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: rustfmt, clippy
+        targets: ${{ inputs.target }}
+
+    - name: Cache Cargo registry and build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          ${{ inputs.working-directory }}/target
+        key: ${{ runner.os }}-cargo-${{ inputs.rust-toolchain }}-${{ hashFiles(format('{0}/Cargo.lock', inputs.working-directory)) }}
+        restore-keys: ${{ runner.os }}-cargo-${{ inputs.rust-toolchain }}-
+
+    - name: Check formatting
+      if: inputs.run-fmt == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: cargo fmt --all -- --check
+
+    - name: Run Clippy
+      if: inputs.run-clippy == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        FEATURES_FLAG="${{ inputs.features != '' && format('--features {0}', inputs.features) || '' }}"
+        cargo clippy --all-targets $FEATURES_FLAG -- -D warnings
+
+    - name: Run tests
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        FEATURES_FLAG="${{ inputs.features != '' && format('--features {0}', inputs.features) || '' }}"
+        cargo test $FEATURES_FLAG
+
+    - name: Build binary
+      id: build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        FEATURES_FLAG="${{ inputs.features != '' && format('--features {0}', inputs.features) || '' }}"
+        TARGET_FLAG="${{ inputs.target != '' && format('--target {0}', inputs.target) || '' }}"
+        cargo build ${{ inputs.cargo-args }} $FEATURES_FLAG $TARGET_FLAG
+
+        # Locate binary (release or debug depending on args)
+        if echo "${{ inputs.cargo-args }}" | grep -q '\-\-release'; then
+          BUILD_DIR="target/${{ inputs.target != '' && format('{0}/release', inputs.target) || 'release' }}"
+        else
+          BUILD_DIR="target/${{ inputs.target != '' && format('{0}/debug', inputs.target) || 'debug' }}"
+        fi
+
+        BINARY=$(find $BUILD_DIR -maxdepth 1 -type f -executable | head -1)
+        echo "binary-path=${BINARY}" >> $GITHUB_OUTPUT
+        echo "✅ Built binary: ${BINARY}"
