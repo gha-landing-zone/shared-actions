@@ -1,0 +1,102 @@
+name: "Build Elixir Service"
+description: "Fetch dependencies, compile, lint, and test an Elixir/Phoenix project"
+
+inputs:
+  elixir-version:
+    description: "Elixir version (e.g. 1.16)"
+    required: false
+    default: "1.16"
+  otp-version:
+    description: "Erlang/OTP version (e.g. 26)"
+    required: false
+    default: "26"
+  working-directory:
+    description: "Path to the project root relative to repo root"
+    required: false
+    default: "."
+  run-credo:
+    description: "Whether to run Credo static analysis"
+    required: false
+    default: "true"
+  run-dialyzer:
+    description: "Whether to run Dialyzer type checking (slow, disable on PRs if desired)"
+    required: false
+    default: "false"
+  mix-env:
+    description: "MIX_ENV to use for build and test"
+    required: false
+    default: "test"
+
+outputs:
+  release-path:
+    description: "Path to the compiled Mix release (if built)"
+    value: ${{ steps.release.outputs.release-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Elixir
+      uses: erlef/setup-beam@v1
+      with:
+        elixir-version: ${{ inputs.elixir-version }}
+        otp-version: ${{ inputs.otp-version }}
+
+    - name: Cache Mix dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.working-directory }}/deps
+          ${{ inputs.working-directory }}/_build
+        key: ${{ runner.os }}-mix-${{ inputs.elixir-version }}-${{ inputs.otp-version }}-${{ hashFiles(format('{0}/mix.lock', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ runner.os }}-mix-${{ inputs.elixir-version }}-${{ inputs.otp-version }}-
+
+    - name: Fetch dependencies
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MIX_ENV: ${{ inputs.mix-env }}
+      run: mix deps.get
+
+    - name: Compile (warnings as errors)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MIX_ENV: ${{ inputs.mix-env }}
+      run: mix compile --warnings-as-errors
+
+    - name: Run Credo
+      if: inputs.run-credo == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MIX_ENV: ${{ inputs.mix-env }}
+      run: mix credo --strict
+
+    - name: Run Dialyzer
+      if: inputs.run-dialyzer == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MIX_ENV: ${{ inputs.mix-env }}
+      run: mix dialyzer
+
+    - name: Run tests
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MIX_ENV: ${{ inputs.mix-env }}
+      run: mix test --cover
+
+    - name: Build release
+      id: release
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MIX_ENV: prod
+      run: |
+        mix deps.get --only prod
+        mix release
+        RELEASE_PATH=$(find _build/prod/rel -maxdepth 1 -type d | tail -1)
+        echo "release-path=${RELEASE_PATH}" >> $GITHUB_OUTPUT
+        echo "✅ Built release: ${RELEASE_PATH}"
