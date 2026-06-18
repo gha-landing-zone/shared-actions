@@ -1,0 +1,171 @@
+name: Reusable Python Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Name of the service (used for ECR repo, ECS service, and notifications)"
+        required: true
+        type: string
+      python-version:
+        required: false
+        type: string
+        default: "3.12"
+      package-manager:
+        description: "pip, poetry, or uv"
+        required: false
+        type: string
+        default: "pip"
+      run-mypy:
+        required: false
+        type: boolean
+        default: true
+      run-ruff:
+        required: false
+        type: boolean
+        default: true
+      test-command:
+        required: false
+        type: string
+        default: "pytest"
+      deploy-env:
+        description: "Target deploy environment: staging or production"
+        required: false
+        type: string
+        default: "staging"
+      skip-deploy:
+        description: "Set to true to run CI only without deploying"
+        required: false
+        type: boolean
+        default: false
+      # AWS / ECR
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-1"
+      ecr-repository:
+        description: "ECR repository name. Defaults to service-name."
+        required: false
+        type: string
+        default: ""
+      # ECS
+      ecs-cluster:
+        description: "ECS cluster name or ARN"
+        required: true
+        type: string
+      ecs-service:
+        description: "ECS service name. Defaults to service-name."
+        required: false
+        type: string
+        default: ""
+      ecs-container-name:
+        description: "Container name inside the task definition to update"
+        required: false
+        type: string
+        default: "app"
+      ecs-task-definition:
+        description: "Path to the ECS task definition JSON in the repo"
+        required: false
+        type: string
+        default: ".aws/task-definition.json"
+    secrets:
+      AWS_ROLE_ARN:
+        required: false
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      ORG_DISPATCH_TOKEN:
+        required: false
+      TEAMS_WEBHOOK_URL:
+        required: false
+
+jobs:
+  # 1. Validate tag standards
+  validate-tag:
+    name: Validate Tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gha-landing-zone/shared-actions/actions/enforce-tags@v1
+
+  # 2. Perform security scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate-tag
+    permissions:
+      security-events: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gha-landing-zone/shared-actions/actions/security-scan@v1
+        with:
+          language: python
+          fail-on-severity: high
+
+  # 3. Build and test
+  build:
+    name: Build & Test
+    runs-on:
+      group: build-runners
+    needs: validate-tag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gha-landing-zone/shared/actions/actions/build-python@v1
+        with:
+          python-version: ${{ inputs.python-version }}
+          package-manager: ${{ inputs.package-manager }}
+          run-mypy: ${{ inputs.run-mypy }}
+          run-ruff: ${{ inputs.run-ruff }}
+          test-command: ${{ inputs.test-command }}
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.service-name }}-app
+          path: .
+          retention-days: 7
+
+  # 4. Build image, push to ECR, and deploy to ECS Fargate
+  deploy:
+    name: Deploy to ${{ inputs.deploy-env }}
+    runs-on:
+      group: deploy-runners
+    needs: [security, build]
+    if: |
+      !inputs.skip-deploy &&
+      (github.ref == 'refs/heads/main' || github.ref_type == 'tag') &&
+      github.event_name != 'pull_request'
+    environment: ${{ inputs.deploy-env }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: gha-landing-zone/shared-actions/actions/deploy-service@v1
+        with:
+          service-name: ${{ inputs.service-name }}
+          environment: ${{ inputs.deploy-env }}
+          aws-region: ${{ inputs.aws-region }}
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          ecr-repository: ${{ inputs.ecr-repository }}
+          ecs-cluster: ${{ inputs.ecs-cluster }}
+          ecs-service: ${{ inputs.ecs-service }}
+          ecs-container-name: ${{ inputs.ecs-container-name }}
+          ecs-task-definition: ${{ inputs.ecs-task-definition }}
+          image-tag: ${{ github.sha }}
+
+      - name: Notify deploy result
+        if: always()
+        uses: your-org/shared-actions/actions/notify-deploy@v1
+        with:
+          service-name: ${{ inputs.service-name }}
+          environment: ${{ inputs.deploy-env }}
+          status: ${{ job.status }}
+          aws-region: ${{ inputs.aws-region }}
+          aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+          teams-webhook-url: ${{ secrets.TEAMS_WEBHOOK_URL }}
