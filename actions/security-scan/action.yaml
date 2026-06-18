@@ -1,0 +1,64 @@
+name: "Security Scan"
+description: >
+  Runs SAST (CodeQL), dependency review, and secrets detection. Embedded in all reusable pipelines and
+  cannot be skipped by service teams.
+
+inputs:
+  language:
+    description: "CodeQL language: java-kotlin, javascript-typescript, python, ruby, etc"
+    required: true
+  fail-on-severity:
+    description: "Minimum CodeQL severity that fails the build: critical, high, medium, low, none"
+    required: false
+    default: "high"
+  run-dependency-review:
+    description: "Whether to run dependency-review-action (only useful on pull_request events)"
+    required: false
+    default: "true"
+  run-secret-scan:
+    description: "Whether to run Trufflehog secrets detection"
+    required: false
+    default: "true"
+  trufflehog-base-ref:
+    description: "Base git ref for TruffleHog incremental scan"
+    required: false
+    default: ${{ github.event.repository.default_branch }}
+
+runs:
+  using: composite
+  steps:
+    # CodeQL SAST
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ inputs.language }}
+        queries: security-extended,security-and-quality
+
+    - name: Autobuild for CodeQL
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+      with:
+        category: "/language:${{ inputs.language }}"
+        fail-on: ${{ inputs.fail-on-severity }}
+        upload: true
+
+    # Dependency review (PR only)
+    - name: Dependency Review
+      if: inputs.run-dependency-review == 'true' && github.event_name == 'pull_request'
+      uses: actions/dependency-review-action@v4
+      with:
+        fail-on-severity: ${{ inputs.fail-on-severity }}
+        deny-licenses: AGPL-3.0, GPL-2.0, GPL-3.0
+        comment-summary-in-pr: always
+
+    # Secrets detection
+    - name: Detect Secrets (TruffleHog)
+      if: inputs.run-secret-scan == 'true'
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: ${{ inputs.trufflehog-base-ref }}
+        head: HEAD
+        extra_args: --only-verified --fail
