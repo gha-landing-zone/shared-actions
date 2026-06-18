@@ -77,6 +77,7 @@ on:
         required: false
 
 jobs:
+  # 1. Validate tag standards
   validate-tag:
     name: Validate Tag
     runs-on: ubuntu-latest
@@ -84,6 +85,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: gha-landing-zone/shared-actions/actions/enforce-tags@v1
 
+  # 2. Perform security scanning
   security:
     name: Security Scan
     runs-on: ubuntu-latest
@@ -99,6 +101,7 @@ jobs:
           language: ruby
           fail-on-severity: high
 
+  # 3. Build and test
   build:
     name: Build & Test
     runs-on:
@@ -119,6 +122,7 @@ jobs:
           path: .
           retention-days: 7
 
+  # 4. Build image, push to ECR, and deploy to ECS Fargate
   deploy:
     name: Deploy to ${{ inputs.deploy-env }}
     runs-on:
