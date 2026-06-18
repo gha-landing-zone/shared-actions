@@ -1,0 +1,82 @@
+name: "Enforce Tag Standards"
+description: >
+  Validates that a git tag matches the required semver pattern before any pipeline proceeds. Runs as
+  the first job in every reusable pipeline.
+
+inputs:
+  tag-pattern:
+    description: "Regex pattern that tags must match. Defaults to strict semver with v-prefix."
+    required: false
+    default: '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?(\+[a-zA-Z0-9._-]+)?$'
+  enforce-on:
+    description: |
+      When to enforce:
+        tag-only  — only enforce when the trigger is a tag push (default)
+        always    — enforce on every run (non-tag runs will fail unless they have a valid tag)
+        never     — skip enforcement entirely (useful for dry-run/debug)
+    required: false
+    default: "tag-only"
+  prerelease-allowed:
+    description: "Whether to allow prerelease identifiers (e.g. v1.2.3-rc.1)"
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Validate tag format
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        ENFORCE_ON="${{ inputs.enforce-on }}"
+        REF_TYPE="${{ github.ref_type }}"
+        TAG="${{ github.ref_name }}"
+        PATTERN="${{ inputs.tag-pattern }}"
+        PRERELEASE_ALLOWED="${{ inputs.prerelease-allowed }}"
+
+        # Skip entirely if enforcement is disabled
+        if [[ "$ENFORCE_ON" == "never" ]]; then
+          echo "ℹ️  Tag enforcement is disabled (enforce-on=never). Skipping."
+          exit 0
+        fi
+
+        # Skip if not a tag push and enforcement is tag-only
+        if [[ "$REF_TYPE" != "tag" && "$ENFORCE_ON" == "tag-only" ]]; then
+          echo "ℹ️  Not a tag push (ref_type=${REF_TYPE}). Skipping tag validation."
+          exit 0
+        fi
+
+        if [[ "$REF_TYPE" != "tag" ]]; then
+          echo "ℹ️  Not a tag push. No tag to validate."
+          exit 0
+        fi
+
+        echo "🔍 Validating tag: ${TAG}"
+        echo "   Pattern: ${PATTERN}"
+
+        # Check prerelease if disallowed
+        if [[ "$PRERELEASE_ALLOWED" == "false" && "$TAG" =~ -[a-zA-Z0-9] ]]; then
+          echo "❌ Prerelease tags are not allowed in this pipeline."
+          echo "   Got: ${TAG}"
+          echo "   Remove the prerelease identifier (e.g. use v1.2.3 instead of v1.2.3-rc.1)"
+          exit 1
+        fi
+
+        # Validate against pattern
+        if ! [[ "$TAG" =~ $PATTERN ]]; then
+          echo ""
+          echo "❌ Tag '${TAG}' does not match the required pattern."
+          echo ""
+          echo "   Required pattern : ${PATTERN}"
+          echo "   Your tag         : ${TAG}"
+          echo ""
+          echo "   Valid examples   : v1.0.0  |  v2.3.14  |  v0.1.0-rc.1"
+          echo ""
+          echo "   To fix: delete this tag and push a corrected one."
+          echo "     git tag -d ${TAG} && git push origin :refs/tags/${TAG}"
+          echo "     git tag v1.2.3 && git push origin v1.2.3"
+          exit 1
+        fi
+
+        echo "✅ Tag '${TAG}' passed validation."
