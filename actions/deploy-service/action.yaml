@@ -1,0 +1,264 @@
+name: "Deploy Service"
+description: >
+  Builds a Docker image, pushes it to AWS ECR, scans it with Trivy, then deploys it to an AWS ECS Fargate
+  Cluster by registering a new task definitiuon revision and updating the ECS service.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Required AWS IAM permissions for the role assumed via OIDC:
+#
+#   ecr:GetAuthorizationToken
+#   ecr:BatchCheckLayerAvailability
+#   ecr:GetDownloadUrlForLayer
+#   ecr:BatchGetImage
+#   ecr:InitiateLayerUpload
+#   ecr:UploadLayerPart
+#   ecr:CompleteLayerUpload
+#   ecr:PutImage
+#   ecr:DescribeRepositories
+#   ecr:CreateRepository                  (if auto-create-ecr-repo: true)
+#   ecs:RegisterTaskDefinition
+#   ecs:DescribeServices
+#   ecs:UpdateService
+#   ecs:DescribeTaskDefinition
+#   ecs:WaitUntilServicesStable
+#   iam:PassRole                          (to pass the ECS task execution role)
+# ─────────────────────────────────────────────────────────────────────────────
+
+inputs:
+  # Service identity
+  service-name:
+    description: "Name of the service. Used as the ECS service name, ECR repo name, and image tag prefix."
+    required: true
+  environment:
+    description: "Target environment: staging, rc, eu, cjis, or fedramp"
+    required: true
+
+  # AWS configuration
+  aws-region:
+    description: "AWS region where ECR and ECS resources live (e.g. us-west-2, us-east-1)"
+    required: false
+    default: "us-west-2"
+  aws-role-arn:
+    description: "ARN of the IAM role to assume via OIDC for ECR push and ECS deploy."
+    required: false
+    default: ""
+  aws-access-key-id:
+    description: "AWS access key ID (fallback if OIDC role ARN is not provided)"
+    required: false
+    default: ""
+  aws-secret-access-key:
+    description: "AWS secret access key (fallback if OIDC role ARN is not provided)"
+    required: false
+    default: ""
+
+  # ECR configuration
+  ecr-registry:
+    description: >
+      Full ECR registry host: <account-id>.dkr.ecr.<region>.amazonaws.com. If left empty, it is
+      derived automatically from the AWS account after authentication.
+    required: false
+    default: ""
+  ecr-repository:
+    description: "ECR repository name. Defaults to the service-name"
+    required: false
+    default: ""
+  image-tag:
+    description: "Docker image tag. Defaults to the git SHA."
+    required: false
+    default: ${{ github.sha }}
+  dockerfile-path:
+    description: "Path to the Dockerfile"
+    required: false
+    default: "./Dockerfile"
+  docker-build-context:
+    description: "Docker build context path"
+    required: false
+    default: "."
+  docker-build-args:
+    description: "Newline-separated Docker build args (KEY=VALUE format)"
+    required: false
+    default: ""
+
+  # ECS configuration
+  ecs-cluster:
+    description: "Name or ARN of the ECS cluster to deploy to"
+    required: true
+  ecs-service:
+    description: "Name of the ECS service to update. Defaults to the service-name."
+    required: false
+    default: ""
+  ecs-task-definition:
+    description: >
+      Path to the ECS task definition JSON template in the repo. The action will update the
+      image field and register a new revision. Example: .aws/task-definition.json.
+    required: false
+    default: ".aws/task-definition.json"
+  ecs-container-name:
+    description: "Name of the container inside the task definition to update with the new image"
+    required: true
+  ecs-wait-for-stability:
+    description: "Whether to wait for the ECS service to reach a stable state after deploy"
+    required: false
+    default: "true"
+  ecs-stability-timeout:
+    description: "How long to wait for ECS service stability (in minutes)"
+    required: false
+    default: "10"
+
+  # Security scanning
+  trivy-severity:
+    description: "Comma-separated Trivy severity levels that cause the build to fail"
+    required: false
+    default: "HIGH,CRITICAL"
+  trivy-ignore-unfixed:
+    description: "Skip vulnerabilities that have no available fix"
+    required: false
+    default: "true"
+  skip-trivy-scan:
+    description: "Bypass Trivy scan"
+    required: false
+    default: "false"
+
+outputs:
+  image-uri:
+    description: "Full ECR image URI including tag (e.g. 123456789.dkr.ecr.us-west-2.amazonaws.com/service:abc123"
+    value: ${{ steps.image-uri.outputs.image-uri }}
+  task-definition-arn:
+    description: "ARN of the newly registered ECS task definition revision"
+    value: ${{ steps.deploy-ecs.outputs.task-definition-arn }}
+
+runs:
+  using: composite
+  steps:
+    # 1. Authenticate to AWS
+    - name: Configure AWS credentials (OIDC)
+      if: inputs.aws-rol-arn != ''
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: gha-deploy-${{ inputs.service-name }}-${{ inputs.environment }}
+
+    - name: Configure AWS credentials (access key fallback)
+      if: inputs.aws-role-arn == '' && inputs.aws-access-key-id != ''
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ inputs.aws-access-key-id }}
+        aws-secret-access-key: ${{ inputs.aws-secret-access-key }}
+        aws-region: ${{ inputs.aws-region }}
+
+    # 2. Log in to Amazon ECR
+    - name: Log in to Amazon ECR
+      id: ecr-login
+      uses: aws-actions/amazon-ecr-login@v2
+
+    # 3. Resolve ECR repository and full image URI
+    - name: Resolve ECR repo and image URI
+      id: image-uri
+      shell: bash
+      run: |
+        # Use explicit registry if provided, otherwise use the one from ecr-login
+        if [[ -n "${{ inputs.ecr-registry }}" ]]; then
+          REGISTRY="${{ inputs.ecr-registry }}"
+        else
+          REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+        fi
+
+        # Default ECR repo name to service name
+        REPO="${{ inputs.ecr-repository != '' && inputs.ecr-repository || inputs.service-name }}"
+
+        IMAGE_URI="${REGISTRY}/${REPO}:${{ inputs.image-tag }}"
+        IMAGE_URI_LATEST="${REGISTRY}/${REPO}:latest"
+
+        echo "registry=${REGISTRY}"        >> $GITHUB_OUTPUT
+        echo "repo=${REPO}"                >> $GITHUB_OUTPUT
+        echo "image-uri=${IMAGE_URI}"      >> $GITHUB_OUTPUT
+        echo "image-uri-latest=${IMAGE_URI_LATEST}" >> $GITHUB_OUTPUT
+
+        echo "📦 Image URI : ${IMAGE_URI}"
+        echo "📦 Latest URI: ${IMAGE_URI_LATEST}"
+
+    # 4. Build and push image to ECR
+    - name: Set up DOcker buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push image to ECR
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ inputs.docker-build-context }}
+        file: ${{ inputs.dockerfile-path }}
+        push: true
+        tags: |
+          ${{ steps.image-uri.outputs.image-uri }}
+          ${{ steps.image-uri.outputs.image-uri-latest }}
+        build-args: ${{ inputs.docker-build-args }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        provenance: true
+        sbom: true
+        labels: |
+          org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+          org.opencontainers.image.environment=${{ inputs.environment }}
+
+    # 5. Scan image with Trivy
+    - name: Scan image with Trivy
+      if: inputs.skip-trivy-scan == 'false'
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.image-uri.outputs.image-uri }}
+        format: sarif
+        output: trivy-results.sarif
+        severity: ${{ inputs.trivy-severity }}
+        exit-code: "1"
+        ignore-unfixed: ${{ inputs.trivy-ignore-unfixed }}
+
+    - name: Upload Trivy results to GitHub Security tab
+      if: always() && inputs.skip-trivy-scan == 'false'
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-results.sarif
+        category: container-scan-${{ inputs.environment }}
+
+    # 6. Update ECS task definition with new image
+    - name: Fill new image into ECS task definition
+      id: task-def
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ inputs.ecs-task-definition }}
+        container-name: ${{ inputs.ecs-container-name }}
+        image: ${{ steps.image-uri.outputs.image-uri }}
+        environment-variables: |
+          DEPLOY_ENV=${{ inputs.environment }}
+          IMAGE_TAG=${{ inputs.image-tag }}
+          GIT_SHA=${{ github.sha }}
+
+    # 7. Register new task definition revision and update ECS service
+    - name: Deploy to ECS Fargate
+      id: deploy-ecs
+      uses: aws-action/amazon-ecs-deploy-task-definition@v2
+      with:
+        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        service: ${{ inputs.ecs-service != '' && inputs.ecs-service || inputs.service-name }}
+        cluster: ${{ inputs.ecs-cluster }}
+        wait-for-service-stability: ${{ inputs.ecs-wait-for-stability }}
+        wait-for-minutes: ${{ inputs.ecs-stability-timeout }}
+        force-new-deployment: true
+
+    # 8. Print deploy summary
+    - name: Deploy summary
+      if: always()
+      shell: bash
+      run: |
+        echo ""
+        echo "╔══════════════════════════════════════════════════════════════╗"
+        echo "║              ECS Fargate Deploy Summary                      ║"
+        echo "╠══════════════════════════════════════════════════════════════╣"
+        echo "║ Service    : ${{ inputs.service-name }}"
+        echo "║ Environment: ${{ inputs.environment }}"
+        echo "║ Cluster    : ${{ inputs.ecs-cluster }}"
+        echo "║ Image URI  : ${{ steps.image-uri.outputs.image-uri }}"
+        echo "║ Task Def   : ${{ steps.deploy-ecs.outputs.task-definition-arn }}"
+        echo "║ Region     : ${{ inputs.aws-region }}"
+        echo "╚══════════════════════════════════════════════════════════════╝"
