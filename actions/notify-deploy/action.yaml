@@ -1,0 +1,288 @@
+name: "Notify Deploy"
+description: >
+  Emits a structured deploy event to AWS CloudWAtch as a custom metric and log entry, and posts a rich
+  Adaptive Card notification to a Microsoft Teams channel via an incoming webhook.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Required AWS IAM permissions (on the same role used by deploy-service):
+#
+#   cloudwatch:PutMetricData    — publish DeploymentCount metric
+#   logs:CreateLogGroup         — idempotent, creates /github-actions/deployments
+#   logs:CreateLogStream        — creates a stream per service
+#   logs:PutLogEvents           — writes the structured deploy event JSON
+#   logs:DescribeLogStreams      — reads sequence token for PutLogEvents
+# ─────────────────────────────────────────────────────────────────────────────
+
+inputs:
+  # Deploy context
+  service-name:
+    description: "Name of the deployed service"
+    required: true
+  environment:
+    description: "Target environment (e.g. staging, rc eu, cjis, fedramp)"
+    required: true
+  status:
+    description: "Deployment outcome: success, failure, or cancelled"
+    required: true
+  image-tag:
+    description: "Docker image tag / git SHA that was deployed"
+    required: false
+    default: ${{ github.sha }}
+  run-url:
+    description: "URL to the GitHub Actions workflow run"
+    required: false
+    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # AWS CloudWatch
+  aws-region:
+    description: "AWS region for CloudWatch (should match the deploy region)"
+    required: false
+    default: "us-west-2"
+  aws-role-arn:
+    description: "IAM role ARN to assume for CloudWatch writes (OIDC). Falls back to ambient credentials if empty."
+    required: false
+    default: ""
+  cloudwatch-log-group:
+    description: "CloudWatch log group name for deploy events"
+    required: false
+    default: "/github-actions/deployments"
+  cloudwatch-metric-namespace:
+    description: CloudWatch custom metric namespace
+    required: false
+    default: "GitHubActions/Deployments"
+  skip-cloudwatch:
+    description: "Set to true to disable all CloudWatch emission (e.g. for local testing)"
+    required: false
+    default: "true"
+
+  # Microsoft Teams
+  teams-webhook-url:
+    description: "Microsoft Teams incoming webhook URL"
+    required: false
+    default: ""
+  skip-teams:
+    description: "Set to true to disable Teams notifications"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # 1. Authenticate to AWS (if an OIDC role is provided)
+    - name: Configure AWS credentials for CloudWatch
+      if: inputs.skip-cloudwatch == 'false' && inputs.aws-role-arn != ''
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: gha-notify-${{ inputs.service-name }}
+
+    # 2. Emit CloudWatch custom metric
+    - name: Emit CloudWatch deployment metrics
+      if: inputs.skip-cloudwatch == 'false'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        STATUS="${{ inputs.status }}"
+        # Map status → metric value (1 = event occurred; use dimensions to filter by result)
+        METRIC_VALUE="1"
+
+        echo "📊 Publishing CloudWatch metric..."
+        aws cloudwatch put-metric-data \
+          --region "${{ inputs.aws-region }}" \
+          --namespace "${{ inputs.cloudwatch-metric-namespace }}" \
+          --metric-data "[
+            {
+              \"MetricName\": \"DeploymentCount\",
+              \"Dimensions\": [
+                {\"Name\": \"Service\",     \"Value\": \"${{ inputs.service-name }}\"},
+                {\"Name\": \"Environment\", \"Value\": \"${{ inputs.environment }}\"},
+                {\"Name\": \"Status\",      \"Value\": \"${STATUS}\"}
+              ],
+              \"Value\": ${METRIC_VALUE},
+              \"Unit\": \"Count\",
+              \"Timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            }
+          ]"
+
+        echo "✅ CloudWatch metric published to namespace: ${{ inputs.cloudwatch-metric-namespace }}"
+
+    # 3. Write structured deploy event to CloudWatch Logs
+    - name: Write deploy event to CloudWatch Logs
+      if: inputs.skip-cloudwatch == 'false'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        LOG_GROUP="${{ inputs.cloudwatch-log-group }}"
+        LOG_STREAM="${{ inputs.service-name }}/${{ inputs.environment }}"
+        TIMESTAMP_MS=$(date +%s%3N)
+        NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+        # Build the structured log event
+        LOG_EVENT=$(jq -n \
+          --arg service    "${{ inputs.service-name }}" \
+          --arg env        "${{ inputs.environment }}" \
+          --arg status     "${{ inputs.status }}" \
+          --arg image_tag  "${{ inputs.image-tag }}" \
+          --arg sha        "${{ github.sha }}" \
+          --arg actor      "${{ github.actor }}" \
+          --arg repo       "${{ github.repository }}" \
+          --arg ref        "${{ github.ref_name }}" \
+          --arg run_id     "${{ github.run_id }}" \
+          --arg run_url    "${{ inputs.run-url }}" \
+          --arg region     "${{ inputs.aws-region }}" \
+          --arg ts         "$NOW_ISO" \
+          '{
+            event_type:   "deployment",
+            service:      $service,
+            environment:  $env,
+            status:       $status,
+            image_tag:    $image_tag,
+            commit_sha:   $sha,
+            deployed_by:  $actor,
+            repository:   $repo,
+            git_ref:      $ref,
+            run_id:       $run_id,
+            run_url:      $run_url,
+            aws_region:   $region,
+            timestamp:    $ts
+          }')
+
+        echo "📝 Writing deploy event to CloudWatch Logs..."
+        echo "   Log group : ${LOG_GROUP}"
+        echo "   Log stream: ${LOG_STREAM}"
+
+        # Ensure the log group exists
+        aws logs create-log-group \
+          --log-group-name "${LOG_GROUP}" \
+          --region "${{ inputs.aws-region }}" 2>/dev/null || true
+
+        # Ensure the log stream exists
+        aws logs create-log-stream \
+          --log-group-name "${LOG_GROUP}" \
+          --log-stream-name "${LOG_STREAM}" \
+          --region "${{ inputs.aws-region }}" 2>/dev/null || true
+
+        # Fetch the sequence token (required for subsequent PutLogEvents calls)
+        SEQUENCE_TOKEN=$(aws logs describe-log-streams \
+          --log-group-name "${LOG_GROUP}" \
+          --log-stream-name-prefix "${LOG_STREAM}" \
+          --region "${{ inputs.aws-region }}" \
+          --query 'logStreams[0].uploadSequenceToken' \
+          --output text 2>/dev/null || echo "None")
+
+        # Build PutLogEvents args — sequence token only needed after the first event
+        PUT_ARGS=(
+          --log-group-name "${LOG_GROUP}"
+          --log-stream-name "${LOG_STREAM}"
+          --region "${{ inputs.aws-region }}"
+          --log-events "[{\"timestamp\": ${TIMESTAMP_MS}, \"message\": $(echo "$LOG_EVENT" | jq -c . | jq -Rs .)}]"
+        )
+        if [[ "$SEQUENCE_TOKEN" != "None" && -n "$SEQUENCE_TOKEN" ]]; then
+          PUT_ARGS+=(--sequence-token "$SEQUENCE_TOKEN")
+        fi
+
+        aws logs put-log-events "${PUT_ARGS[@]}"
+        echo "✅ Deploy event written to CloudWatch Logs"
+
+    # 4. Post Adaptive Card to Microsoft Teams
+    - name: Post Microsoft Teams notification
+      if: inputs.skip-teams == 'false' && inputs.teams-webhook-url != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        STATUS="${{ inputs.status }}"
+        SHORT_SHA="${GITHUB_SHA::7}"
+
+        # Map status → Teams theme colour and icon
+        case "$STATUS" in
+          success)
+            THEME_COLOR="00b300"
+            STATUS_ICON="✅"
+            STATUS_LABEL="Succeeded"
+            ;;
+          failure)
+            THEME_COLOR="cc0000"
+            STATUS_ICON="❌"
+            STATUS_LABEL="Failed"
+            ;;
+          cancelled)
+            THEME_COLOR="ff8c00"
+            STATUS_ICON="⚠️"
+            STATUS_LABEL="Cancelled"
+            ;;
+          *)
+            THEME_COLOR="888888"
+            STATUS_ICON="🔵"
+            STATUS_LABEL="$STATUS"
+            ;;
+        esac
+
+        # Build a Teams Adaptive Card payload (Incoming Webhook / Connector format)
+        # Uses the Office 365 Connector card schema for maximum compatibility
+        # across both the legacy Teams Connector and the new Workflows-based webhooks.
+        PAYLOAD=$(jq -n \
+          --arg theme_color  "$THEME_COLOR" \
+          --arg icon         "$STATUS_ICON" \
+          --arg status_label "$STATUS_LABEL" \
+          --arg service      "${{ inputs.service-name }}" \
+          --arg env          "${{ inputs.environment }}" \
+          --arg actor        "${{ github.actor }}" \
+          --arg sha          "$SHORT_SHA" \
+          --arg ref          "${{ github.ref_name }}" \
+          --arg repo         "${{ github.repository }}" \
+          --arg run_url      "${{ inputs.run-url }}" \
+          --arg image_tag    "${{ inputs.image-tag }}" \
+          --arg ts           "$(date -u '+%Y-%m-%d %H:%M UTC')" \
+          '{
+            "@type":      "MessageCard",
+            "@context":   "https://schema.org/extensions",
+            "themeColor": $theme_color,
+            "summary":    ($icon + " " + $service + " deployed to " + $env + " — " + $status_label),
+            "sections": [
+              {
+                "activityTitle":    ($icon + "  **" + $service + "** → **" + $env + "**"),
+                "activitySubtitle": ("Status: **" + $status_label + "**  ·  " + $ts),
+                "activityImage":    "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png",
+                "facts": [
+                  {"name": "Repository", "value": $repo},
+                  {"name": "Branch / Ref", "value": $ref},
+                  {"name": "Commit SHA",   "value": $sha},
+                  {"name": "Image Tag",    "value": $image_tag},
+                  {"name": "Deployed by",  "value": $actor},
+                  {"name": "Environment",  "value": $env}
+                ],
+                "markdown": true
+              }
+            ],
+            "potentialAction": [
+              {
+                "@type": "OpenUri",
+                "name":  "View Workflow Run",
+                "targets": [{"os": "default", "uri": $run_url}]
+              },
+              {
+                "@type": "OpenUri",
+                "name":  "View Repository",
+                "targets": [{"os": "default", "uri": ("https://github.com/" + $repo)}]
+              }
+            ]
+          }')
+
+        HTTP_STATUS=$(curl -s -o /tmp/teams_response.txt -w "%{http_code}" \
+          -X POST \
+          -H "Content-Type: application/json" \
+          "${{ inputs.teams-webhook-url }}" \
+          -d "$PAYLOAD")
+
+        if [[ "$HTTP_STATUS" -eq 200 ]]; then
+          echo "✅ Teams notification posted for ${{ inputs.service-name }} → ${{ inputs.environment }} ($STATUS_LABEL)"
+        else
+          echo "⚠️  Teams webhook returned HTTP ${HTTP_STATUS}:"
+          cat /tmp/teams_response.txt
+          # Non-fatal — notification failure should not fail the deploy job
+          exit 0
+        fi
