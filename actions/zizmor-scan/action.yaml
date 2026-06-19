@@ -1,0 +1,166 @@
+name: "GitHub Actions Static Analysis"
+description: >
+  Runs zizmor static analysis against all GitHub Actions workflows and composite actions in a given repository.
+  Findings are uploaded to the GitHub Security tab as sarif (for Advanced Security users) and/or emitted as
+  inline PR annotations. This is intended to run on every push and pull_request - catches security issues in
+  workflow files the same way CodeQL catches issues in application code.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What zizmor catches that other tools miss:
+#
+#   template-injection   — ${{ github.event.* }} expansions in run: blocks
+#                          that let attackers inject shell commands via PR titles,
+#                          issue bodies, commit messages, etc.
+#   unpinned-uses        — actions pinned to mutable tags (@v1) instead of
+#                          immutable commit SHAs, enabling supply chain attacks
+#   excessive-permissions— workflow/job-level permissions broader than needed
+#   dangerous-triggers   — pull_request_target and workflow_run misuse
+#   secrets-inherit      — blanket `secrets: inherit` overprovisioning
+#   artipacked           — credentials persisted on disk via actions/checkout
+#   known-vulnerable-actions — actions with published CVEs
+#   ...and 25+ more rules (see https://docs.zizmor.sh/audits/)
+# ─────────────────────────────────────────────────────────────────────────────
+
+inputs:
+  scan-path:
+    description: >
+      Path to scan. Defaults to the repo root so zizmor discovers all .github/workflows/ and composite
+      actions/*/action.yaml files.
+    required: false
+    default: "."
+  format:
+    description: >
+      Output format: sarif (uploads to GitHub Security tab, requires Advanced Security) or GitHUb (inline PR
+      annotations, no Advanced Security Required). Use sarif for the shared-actions repo and production service
+      repos; use GitHub for local/dry-run contexts.
+    required: false
+    default: "sarif"
+  persona:
+    description: >
+      zizmor persona controlling which rules are active:
+        auditor   — all rules including pedantic ones (recommended for
+                    shared-actions and initial migration audit)
+        normal    — default set of security rules (recommended for
+                    per-service CI runs)
+        pedantic  — normal + style/quality rules (optional, noisy)
+      See https://docs.zizmor.sh/usage/#using-personas
+    required: false
+    default: "normal"
+  fail-on-findings:
+    description: >
+      Whether to fail the step if zizmor finds any issues. When format=sarif this defaults to false (sarif
+      upload always exits 0, findings are surfaced via GitHub Security tab and can block PRs via branch
+      ruleset). When format=github this defaults to true so annotations also break the build.
+    required: false
+    default: "false"
+  github-token:
+    description: >
+      GitHub token passed to zizmor for online checks (impostor-commit detection, known-vulnerable-actions
+      CVE lookups, etc.). Omit to run in offline-only mode (faster, but misses network-dependent rules).
+    required: false
+    default: ""
+  config-file:
+    description: >
+      Path to a zizmor.yml configuration file. If not provided, zizmor uses local discovery (looks for
+      .github/zizmor.yml in the repo).
+    required: false
+    default: ""
+
+outputs:
+  sarif-file:
+    description: "Path to the generated sarif file (only set when format=sarif)"
+    value: ${{ steps.run-zizmor.outputs.sarif-file }}
+  finding-count:
+    description: "Number of findings zizmore produced"
+    value: ${{ steps.run-zizmor.outputs.finding-count }}
+
+runs:
+  using: composite
+  steps:
+    # Use uv (pre-installed on GitHub-hosted runners, or available via
+    # astral-sh/setup-uv) to run zizmor from PyPI — no separate install step
+    # needed, uvx handles it in one shot and caches the tool binary.
+    - name: Install uv (if not already present)
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        enable-cache: false # zizmor iteself is the tool, not a dep of the project
+
+    - name: Run zizmor (sarif output)
+      if: inputs.format == 'sarif'
+      id: run-zizmor-sarif
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        ARGS=("--format=sarif")
+        ARGS+=("--persona=${{ inputs.persona }}")
+        [ -n "${{ inputs.config-file }}" ] && ARGS+=("--config=${{ inputs.config-file }}")
+        [ -z "${{ inputs.github-token }}" ] && ARGS+=("--offline")
+
+        echo "🌈 Running zizmor (persona: ${{ inputs.persona }}, format: sarif)..."
+        echo "   Scanning: ${{ inputs.scan-path }}"
+        [ -z "${{ inputs.github-token }}" ] && echo "   Mode: offline (set github-token input to enable online checks)"
+
+        # zizmor always exits 0 with --format=sarif even if findings exist
+        uvx zizmor "${ARGS[@]}" "${{ inputs.scan-path }}" > zizmor-results.sarif
+
+        # Count findings from the SARIF for the summary
+        FINDING_COUNT=$(jq '[.runs[].results // [] | length] | add // 0' zizmor-results.sarif)
+        echo "sarif-file=zizmor-results.sarif" >> $GITHUB_OUTPUT
+        echo "finding-count=${FINDING_COUNT}"  >> $GITHUB_OUTPUT
+
+        echo ""
+        echo "📊 zizmor found ${FINDING_COUNT} finding(s)."
+        echo "   Results will appear in the GitHub Security tab after upload."
+
+    - name: Run zizmor (GitHub annotations output)
+      if: inputs.format == 'github'
+      id: run-zizmor-github
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        ARGS=("--format=github")
+        ARGS+=("--persona=${{ inputs.persona }}")
+        [ -n "${{ inputs.config-file }}" ] && ARGS+=("--config=${{ inputs.config-file }}")
+        [ -z "${{ inputs.github-token }}" ] && ARGS+=("--offline")
+
+        echo "🌈 Running zizmor (persona: ${{ inputs.persona }}, format: github)..."
+        echo "   Scanning: ${{ inputs.scan-path }}"
+
+        # Capture exit code: zizmor exits non-zero when findings are present
+        # in non-SARIF modes, so we handle fail-on-findings explicitly
+        if uvx zizmor "${ARGS[@]}" "${{ inputs.scan-path }}"; then
+          echo "finding-count=0" >> $GITHUB_OUTPUT
+        else
+          EXIT_CODE=$?
+          echo "finding-count=unknown" >> $GITHUB_OUTPUT
+          if [[ "${{ inputs.fail-on-findings }}" == "true" ]]; then
+            echo "❌ zizmor found issues. Failing build (fail-on-findings=true)."
+            exit $EXIT_CODE
+          else
+            echo "⚠️  zizmor found issues (fail-on-findings=false — not failing build)."
+          fi
+        fi
+
+    - name: Upload SARIF results to GitHub Security tab
+      if: inputs.format == 'sarif' && always()
+      uses: github/codeql-action/upload-sarif@7211b7c8077ea37d8641b6271f6a365a22a5fbfa # v4.36.0
+      with:
+        sarif_file: zizmor-results.sarif
+        category: zizmor
+
+    - name: Annotate build with zizmor finding summary
+      if: always()
+      shell: bash
+      run: |
+        COUNT="${{ steps.run-zizmor-sarif.outputs.finding-count || steps.run-zizmor-github.outputs.finding-count || '0' }}"
+        if [[ "$COUNT" == "0" ]]; then
+          echo "✅ zizmor: no issues found in GitHub Actions workflows."
+        else
+          echo "⚠️  zizmor: ${COUNT} finding(s) detected. Review the Security tab or PR annotations."
+        fi
